@@ -161,7 +161,7 @@ export default function QueryPanel() {
             disabled={loading}
             className="px-4 py-2 bg-indigo-600 text-white rounded-md shadow hover:scale-[1.01] transition transform disabled:opacity-60"
           >
-            {loading ? "Submitting..." : "Ask"}
+            {loading ? "Thinking..." : "Ask"}
           </button>
 
           <button onClick={() => { setQ(""); setAnswer(null); setSources([]); setError(null); }} className="px-4 py-2 border rounded-md">
