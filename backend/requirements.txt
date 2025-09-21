@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+sentence-transformers
+numpy
+requests
+PyPDF2
+pydantic
+# FAISS optional; if this fails on windows you can remove it and the fallback will be used
+faiss-cpu

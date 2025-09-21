@@ -1,0 +1,33 @@
+# Python
+venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.env*
+frontend/.vite/
+
+# Data + generated + model files
+backend/data/
+backend/uploads/
+backend/index.faiss
+backend/embeddings.npy
+backend/metadata.pkl
+models/
+*.onnx
+*.pt
+*.bin
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
