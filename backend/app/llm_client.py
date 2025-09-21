@@ -4,10 +4,9 @@ import requests
 import json
 from typing import List, Any
 
-from app.utils import extractive_summary  # reuse improved extractive_summary
+from app.utils import extractive_summary
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
-# Point default to 7b variant we recommended earlier
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:7b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT_SEC", "300"))
 
@@ -41,16 +40,10 @@ def _extract_text_from_ollama_response(obj: Any) -> str:
         return _clean_token(str(obj))[:4000]
 
 def generate_answer_ollama(question: str, contexts: List[str]) -> str:
-    """
-    Prefer Ollama (non-streaming) using a prompt that asks for bullet points.
-    If Ollama fails or returns empty, fall back to a local extractive bullet-point summary.
-    """
-    # Create a compact context: join top contexts (already shortened elsewhere)
     ctx = "\n\n---\n\n".join([c for c in contexts if c])
-    # Clear bullet-points prompt
     prompt = (
         "You are a helpful assistant. Use ONLY the CONTEXT below to answer the QUESTION.\n"
-        "Produce the answer as concise bullet points (each point on a new line prefixed with '- ').\n"
+        "Produce the answer as concise bullet points (each on a new line prefixed by '- ').\n"
         "If the answer is not present in the context, reply exactly: \"I don't know\".\n\n"
         f"CONTEXT:\n{ctx}\n\nQUESTION: {question}\n\n"
         "Answer in 3-6 short bullet points, prioritizing key facts and action items."
@@ -83,24 +76,17 @@ def generate_answer_ollama(question: str, contexts: List[str]) -> str:
 
     answer = _extract_text_from_ollama_response(j)
     if answer:
-        # Ensure it is in bullet form (if model returned plain text, try to convert)
         if not answer.strip().startswith("-"):
-            # naive conversion: split sentences and prefix '- '
-            sentences = [s.strip() for s in answer.split("\n") if s.strip()]
-            if len(sentences) <= 1:
-                # try sentence splitting
-                import re
-                sents = re.split(r'(?<=[.!?])\s+', answer)
-                sents = [x.strip() for x in sents if x.strip()]
-                bullets = ["- " + s for s in sents[:6]]
-                return "\n".join(bullets)
+            import re
+            sents = re.split(r'(?<=[.!?])\s+', answer)
+            sents = [x.strip() for x in sents if x.strip()]
+            bullets = ["- " + s for s in sents[:6]]
+            return "\n".join(bullets)
         return answer
     return _local_bulleted_fallback(question, contexts, note="ollama_empty")
 
-# Local fallback: produce clear bullet points using extractive_summary
 def _local_bulleted_fallback(question: str, contexts: List[str], note: str = "") -> str:
     pieces = []
-    # For each context, extract 1-2 key sentences
     for c in contexts[:6]:
         if not c:
             continue
@@ -109,7 +95,6 @@ def _local_bulleted_fallback(question: str, contexts: List[str], note: str = "")
             pieces.append(summ)
     if not pieces:
         return "I don't know"
-    # Deduplicate and keep most informative (simple heuristic)
     seen = set()
     bullets = []
     for p in pieces:
@@ -117,7 +102,6 @@ def _local_bulleted_fallback(question: str, contexts: List[str], note: str = "")
         if s.lower() in seen:
             continue
         seen.add(s.lower())
-        # ensure shortness
         if len(s) > 300:
             s = s[:300].rsplit(" ", 1)[0] + "..."
         bullets.append(f"- {s}")

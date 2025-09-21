@@ -3,13 +3,10 @@ import uuid
 from typing import Any, Dict
 
 """
-Simple in-memory job manager for hackathon/demo purposes.
+Simple in-memory job manager for demo/hackathon use.
 
-Notes:
-- This is ephemeral: jobs live in process memory and are lost when the server restarts.
-- For production use a persistent queue (Redis, RQ, Celery, etc.).
+Warning: ephemeral (lost on restart). Swap to Redis/Celery for production.
 """
-
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 def create_job() -> str:

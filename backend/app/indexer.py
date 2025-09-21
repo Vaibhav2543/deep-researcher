@@ -1,202 +1,164 @@
 # backend/app/indexer.py
 import os
+import sys
+import time
 import pickle
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Any, Dict
 
-import numpy as np
+from app.utils import file_to_chunks, read_file_text
 
-# sentence-transformers for embeddings
-from sentence_transformers import SentenceTransformer
+# Try to import sentence_transformers and faiss; otherwise fallback to text-search
+try:
+    from sentence_transformers import SentenceTransformer
+    ST_AVAILABLE = True
+except Exception:
+    ST_AVAILABLE = False
 
-# try faiss; if not present we'll fallback to numpy
 try:
     import faiss
     FAISS_AVAILABLE = True
 except Exception:
     FAISS_AVAILABLE = False
 
-from app.utils import load_pdf_text, load_txt, simple_chunk_text
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
-BASE = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.getenv("DATA_DIR", BASE / "data"))
-UPLOADS_DIR = BASE / "uploads"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
-EMB_PATH = DATA_DIR / "embeddings.npy"
-META_PATH = DATA_DIR / "metadata.pkl"
+EMBEDDINGS_PATH = DATA_DIR / "embeddings.npy"
+METADATA_PATH = DATA_DIR / "metadata.pkl"
 FAISS_INDEX_PATH = DATA_DIR / "index.faiss"
 
 class Indexer:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
-        self.embeddings: Optional[np.ndarray] = None
-        self.metadata: List[Dict[str, Any]] = []
-        self.faiss_index = None
-        # Try to load existing index
-        self._load_index_files()
+        self.model = None
+        if ST_AVAILABLE:
+            try:
+                self.model = SentenceTransformer(self.model_name)
+            except Exception:
+                self.model = None
 
-    def _load_index_files(self):
-        if META_PATH.exists():
-            try:
-                with META_PATH.open("rb") as f:
-                    self.metadata = pickle.load(f)
-            except Exception:
-                self.metadata = []
-        if EMB_PATH.exists():
-            try:
-                self.embeddings = np.load(str(EMB_PATH))
-            except Exception:
-                self.embeddings = None
-        if FAISS_AVAILABLE and FAISS_INDEX_PATH.exists():
-            try:
-                self.faiss_index = faiss.read_index(str(FAISS_INDEX_PATH))
-            except Exception:
-                self.faiss_index = None
+        # load index if files exist
+        self.embeddings = None
+        self.metadata = []
+        self.index = None
+        self._load_existing()
 
-    def index_documents(self, paths: List[str]) -> Dict[str, Any]:
+    def _load_existing(self):
+        try:
+            if METADATA_PATH.exists():
+                with open(METADATA_PATH, "rb") as fh:
+                    self.metadata = pickle.load(fh)
+            if EMBEDDINGS_PATH.exists():
+                import numpy as np
+                self.embeddings = np.load(str(EMBEDDINGS_PATH), allow_pickle=False)
+            if FAISS_INDEX_PATH.exists() and FAISS_AVAILABLE and self.embeddings is not None:
+                self.index = faiss.read_index(str(FAISS_INDEX_PATH))
+        except Exception:
+            # don't crash on load errors
+            self.metadata = []
+            self.embeddings = None
+            self.index = None
+
+    def index_documents(self, paths: List[str], chunk_size: int = 1000, overlap: int = 200) -> Dict[str, Any]:
         """
-        Index a list of file paths (pdf or txt). Returns a dict with status and details.
+        Index files. Returns dict with status and counts.
         """
-        to_index_texts = []
-        sources = []
-        for p in paths:
-            pth = Path(p)
-            if not pth.exists():
-                continue
-            if pth.suffix.lower() == ".pdf":
-                text = load_pdf_text(str(pth))
+        try:
+            chunks: List[Tuple[str, str]] = []
+            for p in paths:
+                # file_to_chunks returns (source_path, chunk_text)
+                chunks.extend(file_to_chunks(p, chunk_size=chunk_size, overlap=overlap))
+
+            if not chunks:
+                return {"status": "no_text_found"}
+
+            texts = [c[1] for c in chunks]
+            sources = [c[0] for c in chunks]
+
+            # compute embeddings using sentence-transformers if available
+            if self.model is not None:
+                import numpy as np
+                batch_size = 64
+                all_embs = []
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i:i+batch_size]
+                    emb = self.model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
+                    all_embs.append(emb)
+                embs = np.vstack(all_embs)
+                # append to existing embeddings/metadata
+                if self.embeddings is None:
+                    self.embeddings = embs
+                    self.metadata = [{"source": src, "text": txt} for src, txt in zip(sources, texts)]
+                else:
+                    self.embeddings = np.vstack([self.embeddings, embs])
+                    self.metadata.extend([{"source": src, "text": txt} for src, txt in zip(sources, texts)])
+                # save
+                np.save(str(EMBEDDINGS_PATH), self.embeddings)
+                with open(METADATA_PATH, "wb") as fh:
+                    pickle.dump(self.metadata, fh)
+                # build faiss index if available
+                if FAISS_AVAILABLE:
+                    d = self.embeddings.shape[1]
+                    index = faiss.IndexFlatL2(d)
+                    index.add(self.embeddings)
+                    faiss.write_index(index, str(FAISS_INDEX_PATH))
+                    self.index = index
+                return {"status": "indexed", "n_chunks": len(self.metadata), "faiss": FAISS_AVAILABLE}
             else:
-                try:
-                    text = load_txt(str(pth))
-                except Exception:
-                    text = ""
-            if not text or not text.strip():
-                # no text found for this file
-                continue
-            # chunk the text
-            chunks = simple_chunk_text(text)
-            for c in chunks:
-                to_index_texts.append(c)
-                sources.append({"source": pth.name, "text": c})
-
-        if not to_index_texts:
-            return {"status": "no_text_found"}
-
-        # compute embeddings in batches
-        embeddings = self.model.encode(to_index_texts, convert_to_numpy=True, show_progress_bar=True)
-        # append to existing
-        if self.embeddings is None:
-            self.embeddings = embeddings
-            self.metadata = sources
-        else:
-            self.embeddings = np.vstack([self.embeddings, embeddings])
-            self.metadata.extend(sources)
-
-        # save artifacts
-        np.save(str(EMB_PATH), self.embeddings)
-        with META_PATH.open("wb") as f:
-            pickle.dump(self.metadata, f)
-
-        # try to build faiss index if available
-        if FAISS_AVAILABLE:
-            try:
-                dim = self.embeddings.shape[1]
-                index = faiss.IndexFlatIP(dim)  # inner product for cosine if normalized
-                # normalize embeddings for cosine similarity
-                emb_norm = self.embeddings / (np.linalg.norm(self.embeddings, axis=1, keepdims=True) + 1e-10)
-                index.add(emb_norm.astype(np.float32))
-                faiss.write_index(index, str(FAISS_INDEX_PATH))
-                self.faiss_index = index
-                return {"status": "indexed", "n_chunks": len(self.metadata), "faiss": True}
-            except Exception:
-                # fail silently and fallback to numpy-only
-                self.faiss_index = None
-
-        return {"status": "indexed", "n_chunks": len(self.metadata), "faiss": False}
-
-    def _load_metadata(self) -> List[Dict[str, Any]]:
-        if not self.metadata and META_PATH.exists():
-            with META_PATH.open("rb") as f:
-                self.metadata = pickle.load(f)
-        return self.metadata
-
-    def _safe_cosine_search(self, query_emb: np.ndarray, top_k: int = 5) -> List[Tuple[float, int]]:
-        """
-        Compute cosine distances against stored embeddings in numpy.
-        Returns list of (distance, index) with smaller distance = better.
-        """
-        if self.embeddings is None:
-            raise ValueError("Embeddings not found. Please index documents first.")
-        embs = self.embeddings  # shape (N, D)
-        # normalize
-        embs_norm = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10)
-        qn = query_emb / (np.linalg.norm(query_emb) + 1e-10)
-        sims = embs_norm.dot(qn)
-        dists = 1.0 - sims  # convert similarity to distance
-        idxs = np.argsort(dists)[:top_k]
-        return [(float(dists[i]), int(i)) for i in idxs]
+                # fallback: simple in-memory store of texts for substring search
+                for src, txt in zip(sources, texts):
+                    self.metadata.append({"source": src, "text": txt})
+                with open(METADATA_PATH, "wb") as fh:
+                    pickle.dump(self.metadata, fh)
+                return {"status": "indexed_no_embeddings", "n_chunks": len(self.metadata), "faiss": False}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     def query(self, q: str, top_k: int = 5) -> List[Tuple[float, Dict[str, Any]]]:
         """
-        Query the index for top_k results.
-        Returns list of tuples (distance, metadata_dict)
+        Return list of (distance, metadata) pairs.
         """
-        if self.embeddings is None or not self._load_metadata():
+        # simple checks
+        if (self.metadata is None) or (len(self.metadata) == 0):
             raise ValueError("Index not built or empty. Please upload documents first.")
 
-        # get query embedding
-        q_emb = self.model.encode([q], convert_to_numpy=True)[0]
-
-        # Try FAISS first if available
-        results = []
-        try:
-            if FAISS_AVAILABLE and self.faiss_index is not None:
-                # we store normalized embeddings; compute normalized query
-                qn = q_emb / (np.linalg.norm(q_emb) + 1e-10)
-                qn32 = np.array([qn], dtype=np.float32)
-                D, I = self.faiss_index.search(qn32, top_k)  # returns distances as inner-product values
-                # convert inner-product similarity to distance
-                for dist_val, idx in zip(D[0], I[0]):
-                    # sanity-check dist_val
-                    if np.isnan(dist_val) or dist_val > 1e6 or dist_val < -1e6:
-                        raise ValueError("faiss returned invalid distances")
-                    # inner product similarity s in [-1,1], convert to distance = 1 - s
-                    s = float(dist_val)
-                    d = 1.0 - s
-                    results.append((d, self.metadata[int(idx)]))
-                # filter out invalid indices (just in case)
-                results = [(float(d), m) for d, m in results if isinstance(m, dict)]
-                # dedupe by text
-                seen = set()
-                filtered = []
-                for d, m in results:
-                    t = m.get("text", "")
-                    if t in seen:
+        # if embeddings + faiss available, use vector search
+        if self.embeddings is not None and self.index is not None and ST_AVAILABLE:
+            # compute query embedding
+            try:
+                q_emb = self.model.encode([q], convert_to_numpy=True)
+                import numpy as np
+                D, I = self.index.search(q_emb, top_k)
+                results = []
+                for dist, idx in zip(D[0], I[0]):
+                    if idx < 0 or idx >= len(self.metadata):
                         continue
-                    seen.add(t)
-                    filtered.append((d, m))
-                return filtered
-        except Exception:
-            # fallback to numpy cosine search
-            pass
+                    results.append((float(dist), self.metadata[idx]))
+                return results
+            except Exception as e:
+                # fallback to text search
+                pass
 
-        # Fallback safe cosine search
-        fallback = self._safe_cosine_search(q_emb, top_k=top_k)
-        metadata = self._load_metadata()
-        results = []
-        for dist, idx in fallback:
-            if idx < len(metadata):
-                results.append((dist, metadata[idx]))
-        # dedupe
-        seen = set()
-        filtered = []
-        for d, m in results:
-            t = m.get("text", "")
-            if t in seen:
-                continue
-            seen.add(t)
-            filtered.append((d, m))
-        return filtered
+        # fallback substring scoring: count occurrences and pick top_k
+        scores = []
+        q_low = q.lower()
+        for meta in self.metadata:
+            text = meta.get("text", "")
+            cnt = text.lower().count(q_low)
+            # simple distance metric: negative count -> smaller is better
+            score = -cnt
+            # if none found, use heuristic on overlap of words
+            if cnt == 0:
+                words = set(q_low.split())
+                twords = set(text.lower().split())
+                inter = words.intersection(twords)
+                score = -len(inter)
+            scores.append((score, meta))
+        # sort ascending (more negative is better)
+        scores.sort(key=lambda x: x[0])
+        out = []
+        for s, m in scores[:top_k]:
+            out.append((float(s), m))
+        return out
